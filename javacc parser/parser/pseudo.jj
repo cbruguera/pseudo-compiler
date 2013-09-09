@@ -1,0 +1,3418 @@
+options
+{
+	Lookahead = 10;
+	Ignore_Case = true;
+     //   Force_LA_CHECK = true;
+}
+
+PARSER_BEGIN (Pseudo)
+
+package parser;
+
+//import java.util.HashMap;
+import java.io.FileInputStream;
+import java.util.ArrayList;
+import javassist.*;
+import javassist.bytecode.*;
+import compiler.*;
+import java.io.File;
+
+import static compiler.Util.*;
+
+
+public class Pseudo {
+    public static String[] compilerArguments;
+
+    public static void main (String[] args) throws Exception {
+
+        File fl = new File("InitClass.class");
+        if(fl.exists()){
+            fl.delete();
+        }
+
+        classPool = ClassPool.getDefault();         //pool de clases general
+        declaredTypes = new TypeTable();            //tabla de tipos declarados
+        registryList = new ArrayList<CtClass>();    //tabla de registros definidos
+        pendingTypes = new ArrayList<String>();     //Lista de tipos pendientes por definir (para referencias adelantadas)
+
+        if(args.length == 0){
+            System.out.println("Debe especificar el nombre del archivo fuente");
+            return;
+        }
+
+        Pseudo analizer = new Pseudo(new FileInputStream(args[0]));
+        String currentFile = "";
+        String currentPhase = "";
+        
+        try{
+            // Recorre todos los archivos para borrar las clases ya existentes
+            for(int i = 0; i < args.length; i++){
+                if(i > 0){
+                    FileInputStream input = new FileInputStream(args[i]);
+                    analizer.ReInit(input);
+                }
+
+                analizer.deleteClassFiles();
+            }
+
+            // Recorre la lista de archivos para pre-procesar
+            currentPhase = "preprocesamiento";
+            for(int i = 0; i < args.length; i++){
+
+                currentFile = args[i];
+                System.out.println("Preprocesando: " + args[i]);
+
+                FileInputStream input = new FileInputStream(args[i]);
+                analizer.ReInit(input);
+
+                if(i + 1 < args.length){
+                    analizer.pre_lClases();
+                }else{
+                    analizer.pre_axiom();
+                }
+
+                if(Errors.getCount() > 0){
+                    System.out.println("Se han encontrado " + Errors.getCount() + " errores");
+                    break;  // Si un archivo contiene errores, detiene todo el análisis
+                }
+
+                System.out.println("");
+            }
+
+
+            // Si no hubo errores, recorre nuevamente la lista de archivos para compilar
+            if(Errors.getCount() == 0){
+                currentPhase = "Compilación";
+                for(int i = 0; i < args.length; i++){
+                    currentFile = args[i];
+                    System.out.println("Compilando: " + args[i]);
+
+
+                    FileInputStream input = new FileInputStream(args[i]);
+                    analizer.ReInit(input);
+
+                    if(i + 1 < args.length){
+                        analizer.lClases();
+                    }else{
+                        analizer.axiom();
+                    }
+
+                    if(Errors.getCount() > 0){
+                        System.out.println("Se han encontrado " + Errors.getCount() + " errores");
+                        break;
+                    }
+                    System.out.println("");
+                }
+            }
+        }catch(Exception e){
+            Errors.add("Ocurrió un error (" + e.toString() + ") durante la fase de " + currentPhase + 
+                " en el archivo " + currentFile, getToken(0));
+                e.printStackTrace();
+        }
+
+        if (Errors.getCount() == 0){
+            System.out.println("Compilación exitosa");
+            System.out.println("0 errores encontrados");
+        }
+
+
+        /** Bloque de prueba **
+
+            ClassFile initClass = getOrCreateClass("InitClass");
+            initClass.setAccessFlags(AccessFlag.STATIC);
+            declaring = initClass;
+            globalScope = new Scope();
+            currentScope = globalScope;
+            ClassFile blah = analizer.clase();
+            writeFile(blah);
+
+        /**********/
+    }
+}
+
+PARSER_END (Pseudo)
+
+
+
+void axiom () :
+{
+    if(debug){
+        System.out.println("axiom() --> ");
+    }
+}
+{
+    (dclTipo())* [lClases()] 
+    ini() <EOF>
+}
+
+void lClases () :
+{
+    if(debug){
+        System.out.println("lClases() --> ");
+    }
+
+    ClassFile unaClase;
+}
+{
+    (
+        unaClase = clase()
+        {
+            if(Errors.getCount() == 0){
+                writeFile(unaClase);
+            }
+        }
+    )+
+}
+
+ClassFile clase () :
+{
+    if(debug){
+        System.out.println("clase() --> ");
+    }
+
+    ClassFile nuevaClase;
+    String nombre = new String();
+    String nombreSuper = new String("");
+    Bytecode atributosInit;
+    ArrayList<MethodInfo> metodos = new ArrayList<MethodInfo>();       
+    Token tok;
+    currentScope = new Scope();
+}
+{
+    <TClase> tok = <id> { if(debug) System.out.println("\"" + tok.image +"\" "); } 
+    { nombre = new String(tok.image); }
+    [nombreSuper = herencia()]
+    {
+
+        nuevaClase = getClassFile(nombre);
+        declaring = nuevaClase;
+
+        atributosInit = new Bytecode(declaring.getConstPool());
+
+        if(!nombreSuper.equals(""))
+        {
+            ClassFile superClass = getClassFile(nombreSuper);
+            try{
+                nuevaClase.setSuperclass(superClass.getName());
+            }catch(CannotCompileException e){
+                Errors.add("No se consiguió la superclase \"" + nombreSuper 
+                        + "\" (" + e.getMessage() + ")", getToken(0));
+            }
+        }
+    }
+    [atributosInit = atributos()]
+    [metodos = metodos()]
+    <TFClase>
+    {
+
+        boolean hasConstructor = false;
+
+        for(MethodInfo method : metodos){
+            if (nuevaClase.getName().equals(method.getName())) {
+                // Si el método es un constructor
+                
+                CtClass superclass;
+                hasConstructor = true;
+
+                method.setName("<init>");
+                Bytecode init = new Bytecode(declaring.getConstPool());
+                init.addAload(0);
+
+                try {
+                    if (nuevaClase.getSuperclass().equals("")) {
+                        superclass = classPool.get("java.lang.Object");
+                    } else {
+                        superclass = classPool.get(nuevaClase.getSuperclass());
+                    }
+
+                    init.addInvokespecial(superclass, MethodInfo.nameInit, "()V");
+
+                } catch (NotFoundException nf) {
+                    //FATAL: esto no debería ocurrir
+                    Errors.add("FATAL: Clase java.lang.Object no encontrada. " +
+                        "Error en máquina virtual de Java");
+                }
+
+                atributosInit = append(init, atributosInit);
+
+                // Concatena el código de la inicialización "estática" con el 
+                // código del constructor
+                CodeAttribute initCodeAttribute = append(atributosInit.get(),
+                        method.getCodeAttribute().getCode()).toCodeAttribute();
+
+                try {
+                    initCodeAttribute.setMaxLocals(currentScope.getMaxLocals());
+                    initCodeAttribute.computeMaxStack();
+                } catch (BadBytecode bb) {
+
+
+                    //Errors.add("FATAL (BadBytecode): Error al calcular el tamano de pila del" + 
+                    //"inicializador estático", getToken(0));
+
+                    System.out.println("\u005cnBAD BYTECODE (init)");
+                    System.out.println("getMessage() --> " + bb.getMessage());
+                }
+
+                method.setCodeAttribute(initCodeAttribute);
+                method.setAccessFlags(AccessFlag.PUBLIC);
+            }
+        }
+
+        if (!hasConstructor) {
+            //Si no tiene constructor declarado, añade uno.
+            addClassConstructor(nuevaClase, atributosInit);
+        }
+
+        currentScope = currentScope.destroyChild();
+        
+        declaring = null;
+        return nuevaClase;
+    }    
+}
+
+String herencia () :
+{
+    if(debug) {
+        System.out.println("herencia() --> ");
+    }
+
+    Token tok;
+}
+{
+    <TExtends> tok = <id> { if(debug) System.out.println("\"" + tok.image +"\" "); }
+    {
+        return tok.image;
+    }
+}
+
+Bytecode atributos () :
+{
+    if(debug){
+        System.out.println("atributos() --> ");
+    }
+
+    Bytecode result = new Bytecode(declaring.getConstPool());
+    Bytecode bc = new Bytecode(declaring.getConstPool());
+}
+{
+    (bc = attribDcl()
+    {
+        result = append(result, bc);
+    }
+    )+
+    {
+        return result;
+    }
+}
+
+Bytecode attribDcl () :
+{
+    if(debug){ 
+        System.out.println("attribDcl() --> ");
+    }
+
+    int access = AccessFlag.PUBLIC;
+    ArrayList<String> ids;
+    CtClass tipo; 
+    ArrayList<FieldInfo> campos = new ArrayList<FieldInfo>();
+    Bytecode dclInit = new Bytecode(declaring.getConstPool());
+}
+{
+    [access = acceso()]
+
+    dclInit = dcl(Variable.FIELD, access)
+
+    <TSemicolon>
+    {
+        return dclInit;
+    }
+}
+
+int acceso () :
+{
+    if(debug) {
+        System.out.println("acceso() --> ");
+    }
+
+    Token tok;
+}
+{
+
+    (tok = <TPublico>      {return AccessFlag.PUBLIC;}
+    | tok = <TPrivado>    {return AccessFlag.PRIVATE;}
+    | tok = <TProtegido>  {return AccessFlag.PROTECTED;})
+
+    { if(debug) System.out.println("\"" + tok.image +"\" "); }
+}
+
+ArrayList metodos () :
+{
+    if(debug) {
+        System.out.println("metodos() --> ");
+    }
+
+    ArrayList<MethodInfo> metodos = new ArrayList<MethodInfo>();
+    int access = AccessFlag.PUBLIC;
+    MethodInfo metodo;
+}
+{
+    (
+
+    ([access = acceso()] metodo = funcion(access) 
+    | [access = acceso()] metodo = accion(access))
+    {
+        metodos.add(metodo);
+    }
+    )+
+    {
+        return metodos;
+    }
+}
+
+
+MethodInfo funcion (int accessFlags) :
+{
+    if(debug) System.out.println("funcion(" + accessFlags + ") --> ");
+    
+    CodeAttribute code;
+    MethodInfo mInfo;
+    byte[] bytes;
+    Method function;
+    String desc;
+}
+{
+    mInfo = funcionIni(accessFlags) code = funcionFin()
+    {
+        try{
+            code.computeMaxStack();
+        }catch(BadBytecode bb){
+            /*Errors.add("Error al calcular el tamano de pila de la funcion" 
+                    + mInfo.getName() + mInfo.getDescriptor(), getToken(0));*/
+            System.out.println("BAD BYTECODE (" + mInfo.getName() + "):");
+            System.out.println(bb.getMessage());
+           // printBytecode(code);
+        }
+
+        mInfo.setCodeAttribute(code);
+
+        return mInfo;
+    }
+}
+
+MethodInfo funcionIni (int accessFlags) :
+{
+    if(debug) System.out.println("funcionIni(" + accessFlags + ") --> ");
+    
+    MethodInfo unaFuncion = null;
+    Parametro parametros[] = new Parametro[0];
+    Token tok;
+    CtClass tipo;
+    CtClass[] paramTypes = new CtClass[0];
+    Method methodSymbol;
+}
+{
+    <TFuncion> tok = <id>  { if(debug) System.out.println("\"" + tok.image + "\" "); }
+    <LOpenBracket> parametros = listaParam() <ROpenBracket> <TColon> tipo = tipoGeneral()
+    {
+        int paramCount = parametros.length;
+        paramTypes = new CtClass[paramCount];
+
+        for(int i = 0; i < paramCount; i++){
+            paramTypes[i] = parametros[i].getType();
+        }
+
+        String desc = Descriptor.ofParameters(paramTypes);
+        methodSymbol = new Method(tok.image, tipo, accessFlags, paramTypes);    // son necesarios los method symbols?????????????????????????
+
+        if(currentScope.add(methodSymbol)){
+            unaFuncion = declaring.getMethod(tok.image);
+            unaFuncion.setDescriptor(methodSymbol.getDescriptor());
+            unaFuncion.setAccessFlags(accessFlags);
+
+            declaringMethod = methodSymbol;
+        }else{
+            Errors.add("Definicion duplicada para la función " + tok.image + desc, getToken(0));
+        }
+
+        // Crea el nuevo ámbito para el cuerpo del procedimiento 
+        // (el nuevo ámbito incluye a los parámetros como variables locales)
+        currentScope = currentScope.createChild();
+
+        if((accessFlags & 8) == 0){ 
+            // Si el método NO es estático, incrementa el contador
+            // (porque utilizaría la referencia 0 para "this")
+            currentScope.increaseIndexCount(1);
+        }
+
+        if(!currentScope.addVariables(parametros)){
+            Errors.add("Parametro con nombre duplicado", getToken(0));
+        }
+        return unaFuncion;
+    }
+}
+
+
+CodeAttribute funcionFin () :
+{
+    if(debug) System.out.println("funcionFin() --> ");
+    
+    Bytecode code;
+    CodeAttribute cattr;       
+}
+{
+    code = bloqueIns() <TFFuncion>
+    {
+        cattr = code.toCodeAttribute();
+        cattr.setMaxLocals(currentScope.getMaxLocals());
+        currentScope = currentScope.destroyChild();
+        
+        return cattr;
+    }
+}
+
+
+MethodInfo accion (int accessFlags) :
+{
+    if(debug){ 
+        System.out.println("accion(" + accessFlags + ") --> ");
+    }
+
+    CodeAttribute code;
+    MethodInfo mInfo;
+}
+{
+    mInfo = accionIni(accessFlags) code = accionFin()
+    {
+        try{
+            code.computeMaxStack();
+        }catch(BadBytecode bb){
+            /*Errors.add("FATAL (BadBytecode): Error al calcular el tamano de pila de la accion" 
+                        + mInfo.getName() + mInfo.getDescriptor(), getToken(0));*/
+
+            System.out.println("Error en bytecode: (accion )" + mInfo.getName() 
+                    + mInfo.getDescriptor());
+            System.out.println(bb.getMessage());
+          //  printBytecode(code);
+        }
+
+        mInfo.setCodeAttribute(code);
+
+        return mInfo;
+    }
+}
+
+
+MethodInfo accionIni (int accessFlags) :
+{
+    if(debug) System.out.println("accionIni(" + accessFlags + ") --> ");
+    
+    MethodInfo unaAccion = null;
+    String nombre;
+    Parametro[] parametros = new Parametro[0];
+    CtClass[] paramTypes;
+    Token tok;
+    Method methodSymbol;
+}
+{
+    <TAccion> tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); } 
+    <LOpenBracket> parametros = listaParam() <ROpenBracket>
+    {
+        nombre = tok.image;
+
+        int paramCount = parametros.length;
+        paramTypes = new CtClass[paramCount];
+
+        for(int i = 0; i < paramCount; i++){
+            paramTypes[i] = parametros[i].getType();
+        }
+
+        String desc = Descriptor.ofParameters(paramTypes);
+        
+        methodSymbol = new Method(nombre, CtClass.voidType, accessFlags, paramTypes);
+
+        if(currentScope.add(methodSymbol)){
+            unaAccion = declaring.getMethod(nombre);
+            unaAccion.setDescriptor(Descriptor.ofMethod(CtClass.voidType, paramTypes));
+            unaAccion.setAccessFlags(accessFlags);
+
+            declaringMethod = methodSymbol;
+
+        }else{
+            Errors.add("Definicion duplicada para acción " + nombre + desc, getToken(0));
+        }      
+
+        // Crea el nuevo ámbito para el cuerpo del procedimiento 
+        // (el nuevo ámbito incluye a los parámetros como variables locales)
+        currentScope = currentScope.createChild();
+
+        if((accessFlags & 8) == 0){ 
+            // Si el método NO es estático, incrementa el contador
+            // (porque utilizaría la referencia 0 para "this")
+            currentScope.increaseIndexCount(1);
+        }
+
+        if(!currentScope.addVariables(parametros)){
+            Errors.add("Parametro con nombre duplicado", getToken(0));
+        }
+
+        return unaAccion;
+    }
+}
+
+
+CodeAttribute accionFin () :
+{
+    if(debug) System.out.println("accionFin() --> ");
+    CodeAttribute cattr;
+    Bytecode code;
+}
+{
+    code = bloqueIns() <TFAccion>
+    {
+
+        code.addReturn(CtClass.voidType);
+        cattr = code.toCodeAttribute();
+        cattr.setMaxLocals(currentScope.getMaxLocals());
+        currentScope = currentScope.destroyChild();
+
+        return cattr;
+    }
+}
+
+
+void ini () :
+{
+    if(debug)   System.out.println("ini() --> ");
+    
+    CodeAttribute mainCode;
+    ClassFile initClass = getClassFile("InitClass");
+    //initClass.setAccessFlags(AccessFlag.STATIC);
+    declaring = initClass;
+    globalScope = new Scope();
+    currentScope = globalScope;
+    CtClass[] initParams = new CtClass[0];
+    Bytecode dclCode = new Bytecode(declaring.getConstPool());
+}
+{
+    <TPrograma> dclCode = dcls(Variable.STATIC) mainCode = prog() <TFPrograma>
+    {
+
+        MethodInfo mainMethod = new MethodInfo(initClass.getConstPool(), "main", 
+                "([Ljava/lang/String;)V");
+        MethodInfo constructorInit = new MethodInfo(initClass.getConstPool(), 
+                MethodInfo.nameClinit, "()V");
+
+        dclCode.add(Bytecode.RETURN);
+        CodeAttribute initCode = dclCode.toCodeAttribute();
+        initCode.setMaxLocals(currentScope.getMaxLocals());
+
+        try{
+            mainCode.computeMaxStack();
+            initCode.computeMaxStack();
+        }catch(BadBytecode bb){
+            /*Errors.add("FATAL (BadBytecode): Error al calcular el tamano de pila del" + 
+                    "metodo principal", getToken(0));*/
+            System.out.println("BAD BYTECODE (main)");
+            System.out.println(bb.getMessage());
+           // printBytecode(mainCode);
+        }
+
+        constructorInit.setCodeAttribute(initCode);
+        mainMethod.setCodeAttribute(mainCode);
+
+        mainMethod.setAccessFlags(AccessFlag.setPublic(AccessFlag.STATIC));
+        declaringMethod = new Method("main", "([Ljava/lang/String;)V");  
+
+        try{
+            initClass.addMethod(mainMethod);
+            initClass.addMethod(constructorInit);
+        }catch(DuplicateMemberException e){
+            Errors.add("Error en \"Accion Principal\" (" + e.getMessage() + ")", getToken(0));
+        }
+
+        writeFile(initClass);
+    }
+}
+
+
+Bytecode dcls (int varForm) :
+{
+    if(debug){
+        System.out.println("dcls(" + varForm + ") --> ");
+    }
+
+    Bytecode bc = new Bytecode(declaring.getConstPool());
+    Bytecode result = new Bytecode(declaring.getConstPool());
+}
+{
+
+    // bloque de declaración de variables
+    (bc = dcl(varForm, AccessFlag.PUBLIC) <TSemicolon>
+    {
+        // concatena el bytecode de inicialización de cada variable
+        result = append(result, bc);    
+    })*
+
+    // bloque de declaración de procedimientos
+    (dclFun(AccessFlag.STATIC))*
+    {
+        return result;
+    }
+}
+
+
+void dclTipo () :
+{
+    if(debug){
+        System.out.println("dclTipo() --> ");
+    }
+}
+{
+    registro()
+    | alias() <TSemicolon>
+}
+
+CodeAttribute prog () :
+{
+    if(debug){ 
+        System.out.println("prog() --> ");
+    }
+
+    Bytecode bloque = new Bytecode(declaring.getConstPool());
+    CodeAttribute attr = null;  // "null" sólo para inicializar
+    
+    currentScope = currentScope.createChild();
+    currentScope.setIndexCount(1);
+    currentScope.setMaxLocals(1);
+
+    Parametro[] parametros = new Parametro[0];
+    int paramCount = 0;
+}
+{
+    <TAccionPrincipal>[<LOpenBracket>  <ROpenBracket>]
+    bloque = bloqueIns() <TFAccion>
+    {
+
+        bloque.addReturn(CtClass.voidType);
+        attr = bloque.toCodeAttribute();
+        attr.setMaxLocals(currentScope.getMaxLocals());
+        currentScope = currentScope.destroyChild();
+        return attr;
+    }
+}
+
+
+void dclFun (int accessFlags) :
+{
+    if(debug){ 
+        System.out.println("dclFun(" + accessFlags + ") --> ");
+    }
+
+    MethodInfo mt;
+}
+{
+    mt = funcion(accessFlags)
+    | mt = accion(accessFlags)
+}
+
+
+Bytecode retorno () :
+{
+    if(debug) System.out.println("retorno() --> ");
+
+    Expresion expr;
+    int instr = Bytecode.NOP;
+    Bytecode result = new Bytecode(declaring.getConstPool());
+    String desc;
+}
+{
+    <TRetornar> expr = exp()
+    {
+        desc = Descriptor.of(declaringMethod.getType());
+
+        if(!desc.equals(expr.getTypeDescriptor())){
+            Errors.add("La funcion \"" + declaringMethod.getName() + 
+                    "\" retorna un valor de tipo invalido. Se esperaba: " 
+                    + desc + ". Se encontro: " + expr.getTypeDescriptor(), getToken(0));
+        }
+
+        if(desc.equals("J")){
+            instr = Bytecode.LRETURN;
+        }else if(desc.equals("I")){
+            instr = Bytecode.IRETURN;
+        }else if(desc.equals("Z")){
+            instr = Bytecode.IRETURN;
+        }else if(desc.equals("C")){
+            instr = Bytecode.IRETURN;
+        }else if(desc.equals("D")){
+            instr = Bytecode.DRETURN;
+        }else if(desc.equals("F")){
+            instr = Bytecode.FRETURN;
+        }else if(desc.charAt(0) == 'L'){
+            instr = Bytecode.ARETURN;
+        }else if(desc.charAt(0) == '['){
+            instr = Bytecode.ARETURN;
+        }else if(desc.equals("V")){
+            instr = Bytecode.RETURN;
+        }else {
+            Errors.add("Tipo invalido de retorno: " + desc, getToken(0));
+        }
+
+        expr.add(instr);
+        return expr.getCode();
+    }
+}
+
+
+Parametro[] listaParam () :
+{
+    if(debug) System.out.println("listaParam() --> ");
+
+    ArrayList<Parametro> buffer = new ArrayList<Parametro>();
+    Parametro aux;
+}
+{
+    [
+        aux = parametro()
+        {
+            buffer.add(aux);
+        }
+        (
+            <TComma> aux = parametro()
+            {
+                buffer.add(aux);
+            }
+        )*
+    ]
+    {
+        return buffer.toArray(new Parametro[0]);
+    }
+}
+
+
+Parametro parametro () :
+{
+    if(debug) System.out.println("parametro() --> ");
+
+    CtClass tipo;
+    Token tok;
+    Parametro param;
+    int count = 0;
+}
+{
+    tipo = tipoGeneral() tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); }
+    {
+        param = new Parametro(tipo, tok.image);
+        return param;
+    }
+}
+
+
+Expresion llamadaProc () :
+{
+    if(debug) System.out.println("llamadaProc() --> ");
+
+    Variable var = new Variable();
+}
+{
+
+    var = varRefChain()
+    {
+        if(var.isFunctionCall()){
+            return var.makeExpresion();
+        }
+        else{
+            Errors.add(var.getName() + " no es un procedimiento invocable", 
+                    getToken(0));
+            return new Expresion();
+        }
+    }
+}
+
+
+Expresion llamada (Variable obj) :
+{
+    if(debug) System.out.println("llamada(" + ((obj == null)? "null" : obj.getName()) + ") --> ");
+
+    Expresion[] argumentos = new Expresion[0];
+    ArrayList<CtClass> typeList = new ArrayList<CtClass>();
+    CtClass[] typeArray;
+    Expresion call = new Expresion();
+    Method meth;
+    Token tok;
+    String desc;
+}
+{
+    tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); } <LOpenBracket> [argumentos = args()] <ROpenBracket>
+    {
+        for(Expresion arg : argumentos) {
+            typeList.add(arg.getType());
+        }
+
+        typeArray = typeList.toArray(new CtClass[0]);
+        desc = Descriptor.ofParameters(typeArray);
+
+        if(obj == null){
+            meth = currentScope.getMethod(tok.image, desc);
+            if(meth != null){
+                call = meth.getCallExpresion(argumentos);
+            }else{
+                Errors.add("Llamada a procedimiento desconocido: " + tok.image, getToken(0));
+            }
+        }else{
+
+            Method method = obj.getMethod(tok.image, typeArray);
+
+            if(method != null){
+                call = method.getCallExpresion(obj, argumentos);
+            }else{
+                Errors.add("No se pudo conseguir el metodo '" + tok.image + "' en la clase " 
+                                                + obj.getType().getName(), getToken(0));
+            }
+        }
+
+        return call;
+    }
+}
+
+
+Expresion[] args () :
+{
+    if(debug) System.out.println("args() --> ");
+    
+    Expresion allArgs;
+    Expresion buff;
+    ArrayList<Expresion> arr = new ArrayList<Expresion>();
+    Expresion expr;
+    int count = 0;
+}
+{
+    expr = exp()
+    {
+        arr.add(expr);
+    }
+    (
+    <TComma> expr = exp()
+    {
+        arr.add(expr);
+    }
+    )*
+    {
+        return arr.toArray(new Expresion[0]);
+    }
+}
+
+
+void registro () :
+{
+    if(debug) System.out.println("registro() --> ");
+
+    Token tok;
+    ClassFile registryClass;
+    currentScope = new Scope();
+
+    Bytecode initCode = new Bytecode(declaring.getConstPool());;
+}
+{
+    <TRegistro> tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); }
+    {
+        registryClass = getClassFile(tok.image);    
+        declaring = registryClass;
+
+        if (registryClass == null){
+            Errors.add("Error en la declaración de registro: " + tok.image, getToken(0));
+        }
+    }
+    [<TEq>]
+    initCode = registroIn() <TFRegistro>
+    {   
+        addClassConstructor(registryClass, initCode);
+
+        declaring = null; 
+        currentScope = null;
+        writeFile(registryClass);
+    }
+}
+
+
+Bytecode registroIn () :
+{
+    if(debug) System.out.println("registroIn() --> ");
+
+    Bytecode code = new Bytecode(declaring.getConstPool());
+    Bytecode buff = new Bytecode(declaring.getConstPool());
+}
+{
+    (buff = dcl(Variable.FIELD, AccessFlag.PUBLIC) <TSemicolon>
+        {
+            code = append(code, buff);
+        }
+    )+
+    {
+        return code;
+    }
+}
+
+Bytecode bloqueIns () :
+{
+    if(debug) System.out.println("bloqueIns() --> ");
+
+    Bytecode resultCode = new Bytecode(declaring.getConstPool());
+    Bytecode buffer;
+}
+{
+    (
+        buffer = ins()
+        {
+            resultCode = append(resultCode, buffer);
+        }
+    )*
+    {
+        if (resultCode.length() == 0){
+            resultCode.add(Bytecode.NOP);
+        }
+        return resultCode;
+    }
+}
+
+void alias () :
+{
+    if(debug) System.out.println("alias() --> ");
+
+    Token tok;
+    CtClass tipo;
+}
+{
+    <TTipo> tipo = tipoBase() <TComo> tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); }
+    {
+        // Los alias ya debieron declararse en la primera pasada
+    }
+}
+
+Bytecode ins () :
+{
+    if(debug) System.out.println("ins() --> ");
+
+    Bytecode code = new Bytecode(declaring.getConstPool());
+}
+{
+    (
+        code = dcl(Variable.LOCAL, 0) <TSemicolon>
+        | code = insSimple() <TSemicolon>
+        | code = insEstruc()
+        | code = retorno() <TSemicolon>
+    )
+    {
+        return code;
+    }
+}
+
+Bytecode dcl (int varForm, int access) :   
+{
+    if(debug) System.out.println("dcl(" + varForm + "," + access + ") --> ");
+
+    Bytecode bc = new Bytecode(declaring.getConstPool());
+}
+{
+    (
+        bc = varDcl(varForm, access)
+        | bc = arreglo(varForm, access)
+        | bc = subrango(varForm, access)
+        | bc = enumerado(varForm, access)
+    )
+    {
+        return bc;
+    }
+}
+
+Bytecode varDcl (int varForm, int access) :
+{
+    if(debug) {
+        System.out.println("varDcl(" + varForm + "," + access + ") --> ");
+    }
+
+    ArrayList<String> lista;
+    CtClass tipo;
+    Token tok;
+    Expresion value;
+    FieldInfo campo;
+    Bytecode bc = new Bytecode(declaring.getConstPool());
+    boolean isConstant = false;
+}
+{
+    (
+    tipo = tipoBase() [<TConstante> {isConstant = true;} ] tok = <id>  <TEq> value = exp()
+    {
+        Variable var = new Variable(tok.image, tipo, varForm);
+        var.setConstant(isConstant);
+
+        if(!currentScope.add(var)){
+                Errors.add("Declaracion multiple para la variable \"" + tok.image + "\" ", 
+                    getToken(0));
+        }else{
+            if(compatibleTypes(var.getType(), value.getType())){
+
+                if(varForm == Variable.STATIC || varForm == Variable.FIELD){ 
+                    addClassField(var, varForm, access);    
+                }
+
+                /*if(varForm == Variable.FIELD){
+                    bc.addAload(0);
+                    value.preAppendCode(bc);
+                }*/
+
+                value.preAppendCode(var.getPreStoreCode());
+                value.appendCode(var.getStoreCode());
+            }else{
+                Errors.add("Asignación de tipo incompatible para \"" + var.getName() + 
+                    "\"\nSe esperaba: "+Descriptor.of(var.getType()) + "\nEncontro: " + 
+                    Descriptor.of(value.getType()), getToken(0));
+            }
+        }
+        return value.getCode();
+    }
+    )
+    |
+    (
+    tipo = tipoBase() lista = listaIds()
+    {
+        for(String unId : lista){
+
+            Variable var = new Variable(unId, tipo, varForm);
+
+            if(!currentScope.add(var)){
+                Errors.add("Declaracion multiple para la variable \"" + unId + "\"", getToken(0));
+            }else{
+                //si el tipo es registro, instanciar la clase de una vez..
+                if(isRegistry(tipo)){ 
+                    bc = append(bc, var.getPreStoreCode());
+                    bc = append(bc, getInstantiationCode(tipo));
+                    bc = append(bc, var.getStoreCode());
+                }
+
+                if(varForm == Variable.STATIC || varForm == Variable.FIELD){
+                    addClassField(var, varForm, access);
+                }
+            }
+        }
+        return bc;
+    }
+    )        
+}
+
+
+CtClass tipoGeneral () :
+{
+    if(debug) System.out.println("tipoGeneral() --> ");
+    CtClass t;
+}
+{
+    (t = tipoArreglo() | t = tipoBase())
+    {
+        return t;
+    }
+}
+
+
+CtClass tipoBase () :
+{
+    if(debug) System.out.println("tipoBase() --> ");
+
+    Token tok;
+}
+{
+    (
+    tok = <id> 
+    {
+        CtClass t = declaredTypes.get(tok.image);
+        if(t != null){
+            return t;
+        }else{
+            /*Errors.add("Error al obtener el tipo \"" + tok.image + "\"", getToken(0));
+            return CtClass.voidType;*/
+            // Se pre-declara el tipo para permitir referencias adelantadas
+
+            createClass(tok.image);
+            try{
+                declaredTypes.add(tok.image, classPool.get(tok.image));
+            }catch(NotFoundException nf){
+                Errors.add("Error al crear clase: " + tok.image, getToken(0));
+            }
+            pendingTypes.add(tok.image);    
+        }
+    }
+    | tok = <TLogico>     { if(debug) System.out.println("\"" + tok.image +"\" "); }
+        {return CtClass.booleanType;}
+    | tok = <TEntero>     { if(debug) System.out.println("\"" + tok.image +"\" "); }
+        {return INTEGER_TYPE;}
+    | tok = <TReal>       { if(debug) System.out.println("\"" + tok.image +"\" "); }
+        {return FLOAT_TYPE;}
+    | tok = <TCaracter>   { if(debug) System.out.println("\"" + tok.image +"\" "); }
+        {return CtClass.charType;}
+    | tok = <TCadena>   { if(debug) System.out.println("\"" + tok.image +"\" "); }
+    {
+        try{
+            return classPool.get("java.lang.String");
+        }catch(NotFoundException e){
+            Errors.add("FATAL: Error al cargar la clase java.lang.String", getToken(0));
+            e.printStackTrace();
+        }
+    }
+
+    )       
+}
+
+
+CtClass tipoArreglo () :
+{
+    if(debug) System.out.println("tipoArreglo() --> ");
+    CtClass base;
+    CtClass eltipo = CtClass.voidType;
+    int dim = 0;
+}
+{
+    base = tipoBase()
+    (
+        <LClosedBracket> <RClosedBracket>
+        {
+            dim = dim + 1;
+        }
+    )+
+    {
+        try{
+            eltipo = Descriptor.toCtClass(getArrayDescriptor(dim, base), classPool);
+        }catch(NotFoundException nf){
+            Errors.add("FATAL: Error al cargar clase con descriptor " + 
+                    getArrayDescriptor(dim, base) + " (" + nf.getMessage() + ")", getToken(0));
+        }
+
+        return eltipo;
+    }
+}
+
+
+ArrayList<String> listaIds () :
+{
+    if(debug) System.out.println("listaIds() --> ");
+
+    String[] arr;
+    ArrayList<String> buff = new ArrayList<String>();
+    int count = 0;
+    Token tok;
+}
+{
+    tok = <id> { if(debug) System.out.println("\"" + tok.image +"\" "); }  
+    {
+        count = 1; buff.add(tok.image);
+    }
+    (
+        <TComma> tok = <id> { if(debug) System.out.println("\"" + tok.image +"\" "); } 
+        {
+            count++; buff.add(tok.image);
+        }
+    )*
+    {
+        return buff;
+    }
+}
+
+
+Bytecode arreglo (int varForm, int access) :
+{
+    if(debug) System.out.println("arreglo(" + varForm + "," + access + ") --> ");
+
+    CtClass tipo = CtClass.voidType;
+    Token tok;
+    Expresion constr = new Expresion();
+    ArrayList<Expresion> dimensions;
+    Arreglo var = new Arreglo();
+}
+{
+    ((<TArreglo> tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); } 
+    <TDe> tipo = tipoBase() dimensions = dclDimension()
+    {
+        var = new Arreglo(tok.image, tipo, varForm, dimensions.toArray(new Expresion[0]));
+    })
+    |
+    (<TArreglo> tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); } 
+    <TDe> tipo = tipoBase() 
+    <TEq> constr = arregloConstr(tipo)
+    {
+        var = new Arreglo(tok.image, tipo, varForm);
+
+        if(!Descriptor.of(constr.getType()).equals("V")){ 
+            var.setType(constr.getType());
+        }
+
+        var.setInitCode(constr.getCode());
+    }))
+    {        
+        if (!currentScope.add(var)) {
+            Errors.add("Declaracion multiple para la variable \"" + var.getName() + "\"", getToken(0));
+        } else { 
+
+            if(varForm == Variable.FIELD || varForm == Variable.STATIC){
+                addClassField(var, varForm, access);                   
+            }
+
+            if(varForm == Variable.FIELD){
+                Bytecode thisBc = new Bytecode(declaring.getConstPool());
+                thisBc.addAload(0);
+
+                var.setInitCode(append(thisBc, var.getInitCode()));
+            }
+
+            var.setInitCode(append(var.getInitCode(), var.getStoreCode()));
+
+            if(isRegistry(tipo)){
+
+                Bytecode registryInit = getRegistryArrayInitCode(tipo, var);
+                var.setInitCode(append(var.getInitCode(), registryInit));
+            }
+        }
+
+        return  var.getInitCode();
+    }
+}
+
+
+ArrayList<Expresion> dclDimension () :
+{
+    if(debug) System.out.println("dclDimension() --> ");
+
+    Expresion expr;
+    ArrayList<Expresion> dimensions = new ArrayList<Expresion>();
+}
+{
+    (
+        {
+            expr = new Expresion(INTEGER_TYPE);
+            expr.getCode().addIconst(0);
+        }
+        <LClosedBracket> [expr = exp()] <RClosedBracket>
+        {
+            dimensions.add(expr);
+        }
+    )+
+    {
+        return dimensions;
+    }
+}
+
+
+Expresion arregloConstr (CtClass tipo) :
+{
+    if(debug) System.out.println("arregloConstr(" + tipo.getName() + ") --> ");
+    
+    Expresion[] listaExp = new Expresion[0];
+    Expresion constr = new Expresion();
+    ArrayList<Expresion> dimensions;
+    CtClass tipo2;
+}
+{
+    <LBrace> [listaExp = args()] <RBrace>
+    {
+        constr = getArrayConstructorCode(listaExp, tipo);
+        return constr;
+    }
+    |
+    tipo2 = tipoBase() dimensions = dclDimension()
+    {
+        constr = getArrayTypeInit(dimensions.toArray(new Expresion[0]), tipo2);
+        return constr;
+    }
+}
+
+
+Bytecode subrango (int varForm, int access) :
+{
+    if(debug) System.out.println("subrango(" + varForm + "," + access + ") --> ");
+    CtClass tipo;
+    String desc;
+    Expresion exp1, exp2;
+    Bytecode result = new Bytecode(declaring.getConstPool());
+    Variable var = new Variable();
+    String exp1Desc, exp2Desc;
+    Token tok;
+}
+{
+    <TSubrango> tipo = tipoBase() tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); } 
+    <TEq> 
+    <LClosedBracket> exp1 = exp() <TDotDotDot> exp2 = exp() <RClosedBracket>
+    {
+        try{
+            var = new Variable(tok.image, classPool.get("compiler.Subrango"), varForm);
+        }catch(NotFoundException nf){
+            Errors.add("FATAL: Error al cargar la clase Subrango", getToken(0));
+        }
+
+        var.setBaseType(tipo);
+
+        if(!currentScope.add(var)){
+                Errors.add("Declaracion multiple para la variable \"" + tok.image + "\"", 
+                        getToken(0));
+        }else{
+            if(varForm == Variable.STATIC || varForm == Variable.FIELD){
+                addClassField(var, varForm, access);
+            }
+
+            result = getSubrangoInitCode(var, varForm, exp1, exp2);
+        }
+
+        return result;
+    }
+}
+
+
+Bytecode enumerado (int varForm, int access) :
+{
+    if(debug)  System.out.println("enumerado(" + varForm + "," + access + ") --> ");
+
+    Bytecode result = new Bytecode(declaring.getConstPool());
+    ArrayList<String> ids;
+    Variable var = new Variable();
+    FieldInfo campo;
+    Expresion expr;
+    Token tok;
+}
+{
+    (
+    <TEnumerado> tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); } 
+    <TEq> <LClosedBracket> ids = listaIds() <RClosedBracket>
+    {
+        int cont = 1;
+
+        for(String unId : ids){
+            var = new Variable(unId, INTEGER_TYPE, varForm);
+            var.setConstant(true);
+
+            if(!currentScope.add(var)){
+                Errors.add("Nombre duplicado: \"" + unId + "\". No puede declararse como constante", 
+                        getToken(0));
+                break;
+            }else{
+                if(varForm == Variable.STATIC || varForm == Variable.FIELD){
+                    addClassField(var, varForm, access);
+                }
+
+                if(Descriptor.of(INTEGER_TYPE).equals("I")){
+                    result.addIconst(cont);
+                }else{
+                    result.addLconst(cont);
+                }
+
+                result = append(result, var.getStoreCode());
+            }
+
+            cont++;
+        }
+
+        return result;
+    })
+    |
+    (<TEnumerado> <id> <TEq>
+        <LClosedBracket>
+        tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); } <TEq> expr = exp()
+        {
+            if(Descriptor.of(expr.getType()).equals(Descriptor.of(INTEGER_TYPE))){
+                var = new Variable(tok.image, INTEGER_TYPE, varForm);
+                var.setConstant(true);
+
+                if(!currentScope.add(var)){
+                    Errors.add("Nombre duplicado: \"" + tok.image + 
+                            "\". No puede declararse como constante", getToken(0));
+                    //break ?
+                }else{
+
+                   if(varForm == Variable.STATIC || varForm == Variable.FIELD){
+                        addClassField(var, varForm, access);
+                    }
+
+                    result = append(result, expr.getCode());
+                    result = append(result, var.getStoreCode());
+                }
+            }else{
+                Errors.add("Las expresiones de inicialización de enumerados deben ser " + 
+                        "de tipo entero", getToken(0));
+               //break; ?
+            }
+
+        }
+        (<TComma> tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); } <TEq> expr = exp()
+        {
+            if(Descriptor.of(expr.getType()).equals(Descriptor.of(INTEGER_TYPE))){
+                var = new Variable(tok.image, INTEGER_TYPE, varForm);
+                var.setConstant(true);
+
+                if(!currentScope.add(var)){
+                    Errors.add("Nombre duplicado: \"" + tok.image + "\". No puede declararse " +
+                            "como constante", getToken(0));
+                    //break;
+                }else{
+
+                    if(varForm == Variable.STATIC || varForm == Variable.FIELD){
+                        addClassField(var, varForm, access);
+                    }
+
+                    result = append(result, expr.getCode());
+                    result = append(result, var.getStoreCode());
+                }
+            }else{
+                Errors.add("Las expresiones de inicialización de enumerados deben ser de tipo entero", 
+                    getToken(0));
+                //break;
+            }
+        }
+        )*
+        <RClosedBracket>
+        {
+            return result;
+        }
+    {
+    })
+}
+
+
+Bytecode insSimple () :
+{
+    if(debug) System.out.println("insSimple() --> ");
+
+    Bytecode code = new Bytecode(declaring.getConstPool());
+    Expresion expr = new Expresion();
+}
+{
+    (
+    code = insAsignacion()
+    | code = insEsc()
+    | code = insLec()
+    | expr = llamadaProc()
+    {
+        code = expr.getCode();
+    }
+    )
+    {
+        return code;
+    }
+}
+
+
+Bytecode insLec () :
+{
+    if(debug) System.out.println("insLec() --> ");
+
+    Bytecode bc = new Bytecode(declaring.getConstPool());
+    Variable var;
+}
+{
+    <TLeer> <LOpenBracket> var = varRefChain() <ROpenBracket>
+    {
+
+        bc = var.getReadCode();
+
+        return bc;
+    }
+}
+
+
+Bytecode insEsc () :
+{
+    if(debug) System.out.println("insEsc() --> ");
+
+    Bytecode code = new Bytecode(declaring.getConstPool());
+    Expresion expr;
+}
+{
+    <TEscribir> <LOpenBracket> expr = exp() <ROpenBracket>
+    {
+        code = expr.getPrintln();
+
+        return code;
+    }
+}
+
+
+Bytecode insEstruc () :
+{
+    if(debug) System.out.println("insEstruc() --> ");
+
+    Bytecode code;
+}
+{
+    (
+    code = insSi()
+    | code = insMientras()
+    | code = insRepetir()
+    | code = insSeleccion()
+    | code = insPara()
+    )
+    {
+        return code;
+    }
+}
+
+
+Bytecode insAsignacion () :
+{
+    if(debug) System.out.println("insASignacion() --> ");
+
+    Expresion value = new Expresion();
+    Bytecode code = new Bytecode(declaring.getConstPool());
+    Variable var;
+}
+{
+    var = varRefChain() <TEq> value = exp()
+    {
+        if(!var.isConstant()){
+
+            if(compatibleTypes(var.getType(), value.getType())){
+
+                code = append(code, var.getPreStoreCode());
+                code = append(code, value.getCode());
+                code = append(code, var.getStoreCode());
+            }else{
+                Errors.add("Asignación de tipo incompatible para \"" + var.getName() + 
+                        "\"\nSe esperaba: "+Descriptor.of(var.getType()) + "\nEncontro: " + 
+                        Descriptor.of(value.getType()), getToken(0));
+            }
+        }else{
+            Errors.add("Intento de asignación para una constante \"" + var.getName() + 
+                    "\"", getToken(0));
+        }
+
+        return code;
+    }
+}
+
+
+Variable varRefChain () :
+{
+    if(debug) System.out.println("varRefChain() --> ");
+
+    Variable result = new Variable();
+    Variable aux = new Variable();
+}
+{
+    result = varRef(null)    
+    (
+        <TDot> result = varRef(result)
+    )*
+
+    {
+        return result;
+    }
+}
+
+
+Variable varRef (Variable obj) :
+{
+    if(debug){
+        if(obj == null){
+            System.out.println("varRef(null) --> ");
+        }else{
+            System.out.println("varRef(" + obj.getName() + ") --> ");
+        }
+        
+    }
+
+    Expresion expResult = new Expresion();
+    ArrayList<Expresion> accessExpr;
+
+    Variable var = new Variable();
+}
+{
+    
+    (expResult = llamada(obj)
+    {
+        var.setType(expResult.getType());
+        var.appendLoadCode(expResult.getCode());
+        var.setFunctionCall(true);
+        // falta el store y el preStore
+    }
+    |
+    <TTam>
+    {
+
+        if(obj != null && obj.isArray()){
+            Expresion result = obj.getSizeExpresion();
+            return result.makeVariable();
+        }else{
+            Errors.add("La variable es nula o no posee tamaño", getToken(0));
+        }
+    }
+    |
+    var = varId(obj))
+    
+    [
+        accessExpr = dclDimension()
+        {
+            var = var.getAccessCodes(accessExpr.toArray(new Expresion[0]));  
+
+            if(var == null){
+                Errors.add("La variable no es un arreglo", getToken(0));
+                var = new Variable();
+            }
+        }
+    ]
+
+    {
+        return var;
+    }     
+}
+
+
+Variable vCampo (Variable obj) :
+{
+    if(debug){
+        if(obj == null){
+            System.out.println("vCampo(null) --> ");
+        }else{
+            System.out.println("vCampo(" + obj.getName() + ") --> ");
+        }
+         
+    }
+
+    Variable campo = new Variable();
+}
+{
+    <TDot> campo = varRef(obj) 
+    
+    {
+        return campo;
+    }
+}
+
+
+Variable varId (Variable obj) :
+{
+    if(debug) {
+        if(obj == null){
+            System.out.println("varId(null) --> ");
+        }else{
+            System.out.println("varId(" + obj.getName() + ") -->");
+        }
+    }
+
+    Variable var;
+    Token tok;
+    Expresion index, indexAccum;
+    ArrayList<Expresion> exprs = new ArrayList<Expresion>();
+    indexAccum = new Expresion();
+
+    int arrayDimensions = 0;
+    int proxIndex = 1;
+    boolean isIndexed = false;
+    String desc = new String();
+}
+{        
+    (
+
+
+    <TSelf> 
+    {
+        var = new Variable();
+        var.setType(getCtClass(declaring.getName()));
+        var.getLoadCode().addAload(0);
+        var.getStoreCode().addAload(0);
+        var.getPreStoreCode().addAload(0);
+        // obtener el tipo de declaring, y poner load = store en 0
+    }
+    |
+
+    tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); }
+    {
+        if(obj == null){    // Si es un objeto "raiz"
+            var = currentScope.getVariable(tok.image);     
+
+            if(var == null){
+                Errors.add("No se encontro la variable: " + tok.image, getToken(0));
+            }else{
+                /*if(var.getForm() == Variable.FIELD && var.getDeclaringClassName().equals(declaring.getName())){
+                    Bytecode thisCode = new Bytecode(declaring.getConstPool());
+                    thisCode.addAload(0);
+
+                    var.preAppendPreStoreCode(thisCode);   
+                    var.preAppendLoadCode(thisCode);
+                }*/
+
+            }
+
+        }else{
+
+            CtClass fieldType = obj.getFieldType(tok.image);
+            if(fieldType != null){
+                var = new Variable(tok.image, fieldType, Variable.FIELD);
+                var.setDeclaringClassName(obj.getType().getName()); //????
+                var.setObjectField(true);
+                var.makeCodes(-1);
+
+                var.preAppendPreStoreCode(obj.getLoadCode());   
+                var.preAppendLoadCode(obj.getLoadCode());
+
+            }else{
+                var = new Variable();
+                Errors.add("No se consiguio el campo \"" + tok.image + "\" en el objeto " 
+                        + obj.getName(), getToken(0));
+            }
+        }
+
+        if(var != null){
+
+        }else{
+
+            Errors.add("Simbolo indefinido: " + tok.image, getToken(0));
+            var = new Variable(CtClass.voidType, Variable.LOCAL);
+        }
+    }
+    )
+    {
+        return var;
+    }
+}
+
+
+Expresion instanciacion () :
+{
+    if(debug) 
+        System.out.println("instanciacion() --> ");
+
+    Expresion expr = new Expresion();
+    Expresion[] argumentos = new Expresion[0];
+    ArrayList<CtClass> types = new ArrayList<CtClass>();
+    String desc;
+    Token tok;
+}
+{
+    <TNuevo> tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); } 
+    <LOpenBracket> [argumentos = args()] <ROpenBracket>
+    {
+        for(Expresion arg : argumentos){
+            types.add(arg.getType());
+        }
+
+        CtClass type = declaredTypes.get(tok.image);
+
+        if(type != null){
+            Bytecode argsCode = getInstantiationCode(type, argumentos);
+            expr.appendCode(argsCode);
+            expr.setType(type);
+        }else{
+            Errors.add("Instanciacion de clase desconocida: " + tok.image, getToken(0));
+        }
+        return expr;
+    }
+}
+
+
+Bytecode insSi () :
+{
+    if(debug) System.out.println("insSi() --> ");
+
+    Expresion expr;
+    Bytecode bloque = new Bytecode(declaring.getConstPool());
+    Bytecode elseb = null;
+
+    IfCond cond;
+}
+{
+    <TSi> expr = exp() <TEntonces> bloque = bloqueIns()
+
+    [
+    <TSino> elseb = bloqueIns()        
+    ]
+
+    <TFSi>
+    {
+        if(elseb == null){
+            cond = new IfCond(expr, bloque);
+        }else{
+            cond = new IfCond(expr, bloque, elseb);
+        }
+
+        return cond.getCode();
+    }
+}
+
+Bytecode insMientras () :
+{
+    if(debug) System.out.println("insMientras() --> ");
+
+    CicloMientras loop;
+    Expresion expr;
+    Bytecode bloque;
+
+    currentScope = currentScope.createChild();
+}
+{
+    <TMientras> expr = exp() <THacer> bloque = bloqueIns() <TFMientras>
+    {
+        loop = new CicloMientras(expr, bloque);
+
+        currentScope = currentScope.destroyChild();
+        return loop.getCode();
+    }
+}
+
+
+Bytecode insRepetir () :
+{
+    if(debug) System.out.println("Repetir() --> ");
+
+    CicloRepetir loop;
+    Bytecode bloque = new Bytecode(declaring.getConstPool());
+    Expresion expr = new Expresion();
+    Expresion expResult = new Expresion();
+
+    currentScope = currentScope.createChild();
+}
+{
+    <TRepetir> bloque = bloqueIns() <THasta> expr = exp() <TSemicolon>
+    {
+        loop = new CicloRepetir(bloque, expr);
+
+
+        currentScope = currentScope.destroyChild();
+
+        return loop.getCode();
+    }
+}
+
+
+Bytecode insSeleccion () :
+{
+    if(debug) System.out.println("insSeleccion() --> ");
+
+    Bytecode bc = new Bytecode(declaring.getConstPool());
+}
+{
+    <TSeleccion> bc = bloqueSeleccion() <TFSeleccion>
+    {
+        return bc;
+    }
+}
+
+
+Bytecode bloqueSeleccion () :
+{
+    if(debug) System.out.println("bloqueSeleccion() --> ");
+
+    Bytecode bloque;
+    Expresion expBuff;
+
+    ArrayList<Bytecode> listaBloques = new ArrayList<Bytecode>();
+    ArrayList<Expresion> listaExp = new ArrayList<Expresion>();
+
+    Expresion expResult = new Expresion();
+
+    int selSize = 0;
+    int expCount = 0;
+}
+{
+    (
+    expBuff = exp() <TColon> bloque = bloqueIns()
+    {
+        listaExp.add(expBuff);
+        listaBloques.add(bloque);
+
+        // index = exp + IFEQ + bloque + GOTO
+        selSize = selSize + expBuff.getCode().getSize() + 3 + bloque.getSize() + 3;
+        expCount++;
+    }
+    )+
+    {
+        BloqueSeleccion select = new BloqueSeleccion(listaExp, listaBloques);
+        return select.getCode();
+    }
+}
+
+
+Bytecode insPara () :
+{
+    if(debug) System.out.println("insPara() --> ");
+
+    Bytecode bc = new Bytecode(declaring.getConstPool());
+    Variable x;
+    Expresion expr1, expr2;
+    Expresion expr3 = null;
+    Bytecode bloque;
+    Token tok;
+    CtClass tipo;
+    CicloPara loop;
+}
+{
+    <TPara> tok = <id> { if(debug) System.out.println("\"" + tok.image + "\" "); } 
+    <TEq> expr1 = exp() <THasta> expr2 = exp() [<TEn> expr3 = exp()] <THacer>
+    {
+        currentScope = currentScope.createChild();
+
+        x = new Variable(tok.image, expr1.getType(), Variable.LOCAL);
+
+        if(!currentScope.add(x)){
+            Errors.add("Error al crear indice de ciclo Para", getToken(0));
+        }
+    }
+    bloque = bloqueIns() <TFPara>
+    {
+
+        loop = new CicloPara(x, expr1, expr2, expr3, bloque);
+
+        currentScope = currentScope.destroyChild();
+        return loop.getCode();
+    }
+}
+
+
+Expresion exp () :
+{
+    if(debug) System.out.println("exp() --> ");
+
+    Expresion code = new Expresion();
+    Expresion buff = new Expresion();
+    String desc1, desc2;
+}
+{
+    code = expY()
+    (
+    <OpOr> buff = expY()
+    {
+        desc1 = Descriptor.of(code.getType());
+        desc2 = Descriptor.of(buff.getType());
+        if(desc1.equals("Z") && desc2.equals("Z")){
+            code.appendCode(buff.getCode());
+            code.add(Bytecode.IOR);
+        }else{
+            Errors.add("Operador logico aplicado a expresiones no booleanas", getToken(0));
+        }
+    }
+    )*
+    {
+
+        return code;
+    }
+}
+
+
+Expresion expY () :
+{
+    if(debug) System.out.println("expY() --> ");
+
+    Expresion code = new Expresion();
+    Expresion buff = new Expresion();
+    String desc1, desc2;
+}
+{
+    code = expEq()
+    (
+    <OpAnd> buff = expEq()
+    {
+        desc1 = Descriptor.of(code.getType());
+        desc2 = Descriptor.of(buff.getType());
+        if(desc1.equals("Z") && desc2.equals("Z")){
+            code.appendCode(buff.getCode());
+            code.add(Bytecode.IAND);
+        }else{
+            Errors.add("Operador logico aplicado a expresiones no booleanas", getToken(0));
+        }
+    }
+    )*
+    {
+        return code;
+    }
+}
+
+
+Expresion expEq () :
+{
+    if(debug) System.out.println("expEq() --> ");
+
+    Expresion expResult = new Expresion();
+    Expresion exp1;
+    Expresion exp2;
+    Expresion exp2Copy = new Expresion();
+    boolean first = true;
+    String op;
+    Token tok;
+}
+{
+    expResult = expRel()
+    (
+        (
+        tok = <OpEq>
+        |
+        tok = <OpNeq>
+        ) exp2 = expRel()
+        {
+            op = tok.image;
+            if(first){
+                exp1 = expResult;
+            }else{
+                exp1 = exp2Copy;
+            }
+
+            exp2Copy = new Expresion(exp2);
+            exp1.compare(op, exp2);
+
+            if(!first){
+                expResult.appendCode(exp1.getCode());
+                expResult.add(Bytecode.IAND);
+            }
+
+            first = false;
+        }
+    )*
+    {
+        return expResult;
+    }
+}
+
+
+Expresion expRel () :
+{
+    if(debug) System.out.println("expRel() --> ");
+
+    Expresion expResult = new Expresion();
+    Expresion exp1;
+    Expresion exp2;
+    Expresion exp2Copy = new Expresion();
+    boolean first = true;
+    String op;
+}
+{
+    expResult = expSum()
+    (
+    op = OpRel()
+    exp2 = expSum()
+    {
+        if(first){
+            exp1 = expResult;
+        }else{
+            exp1 = exp2Copy;
+        }
+
+        exp2Copy = new Expresion(exp2);
+        exp1.compare(op, exp2);
+
+        if(!first){
+            expResult.appendCode(exp1.getCode());
+            expResult.add(Bytecode.IAND);
+        }
+
+        first = false;
+    }
+    )*
+    {
+        return expResult;
+    }
+}
+
+
+String OpRel() :
+{
+    if(debug) System.out.println("OpRel() --> ");
+
+    String rel;
+}
+{
+    ( <OpLt> { rel = "<"; }
+    | <OpLe> { rel = "<="; }
+    | <OpGt> { rel = ">"; }
+    | <OpGe> { rel = ">="; }
+    )
+    {
+        return rel;
+    }
+}
+
+
+Expresion expSum () :
+{
+    if(debug) System.out.println("expSum() --> ");
+
+    Expresion codeExp1 = new Expresion();
+    Expresion codeExp2 = new Expresion();
+
+    String opStr;
+}
+{
+    codeExp1 = expMul()
+    (
+        opStr = OpSum()
+        codeExp2 = expMul()
+        {
+            codeExp1.operate(opStr, codeExp2);
+        }
+    )*
+    {
+
+        return codeExp1;
+    }
+}
+
+
+String OpSum() :
+{
+    if(debug) System.out.println("OpSum() --> ");
+
+    String op;
+}
+{
+    (
+    <OpAdd>
+    {
+        op = "+";
+    }
+    | <OpSub>
+    {
+        op = "-";
+    }
+    )
+    {
+        return op;
+    }
+}
+
+
+Expresion expMul () :
+{
+    if(debug) System.out.println("expMul() --> ");
+
+    Expresion exp1, exp2;
+    Token tok;
+}
+{
+    exp1 = expU()
+
+    (
+        tok = OpMult()
+        exp2 = expU()
+        {
+            exp1.operate(tok.image, exp2);
+        }
+    )*
+    {
+        return exp1;
+    }
+}
+
+
+Token OpMult() :
+{
+    if(debug) System.out.println("OpMul() --> ");
+
+    Token tok;
+}
+{
+    ( tok = <OpMul>
+    | tok = <OpMod>
+    | tok = <OpDiv>
+    | tok = <OpFDiv>
+    | tok = <OpPow>
+    )
+    {
+        return tok;
+    }
+}
+
+
+Expresion expU () :
+{
+    if(debug) System.out.println("expU() --> ");
+
+    Expresion expResult = new Expresion();
+    Bytecode bc = new Bytecode(declaring.getConstPool());   //para las operaciones unarias
+    String op;
+    String buff = new String();
+}
+{
+    (
+        op = opU()
+        { buff = op + buff ; }
+    )*
+    expResult = factor()
+    {
+        for(int i = 0; i < buff.length(); i++){
+            expResult.operate(buff.substring(i, i + 1));
+        }
+
+        return expResult;
+    }
+}
+
+
+String opU () :
+{
+    if(debug) System.out.println("opU() --> ");
+
+    String op;
+}
+{
+    (<OpSub>    { op = "-"; }
+    | <OpAdd>   { op = "+"; }
+    | <OpFalse> { op = "!"; }
+    )
+    {
+       return op;
+    }
+}
+
+
+Expresion factor () :
+{
+    if(debug) System.out.println("factor() --> ");
+
+    Bytecode bc = new Bytecode(declaring.getConstPool());
+    CtClass tipo = CtClass.voidType;
+    Constante con;
+    Expresion expResult = new Expresion();
+    Variable var;
+
+}
+{
+    (
+
+    expResult = defaultFunction()
+    |
+
+    var = varRefChain()
+    {
+        expResult = var.makeExpresion();
+        expResult.setVariable(true);        
+    }
+    | con = constante()
+    {
+        bc = con.getCode();
+        expResult.setType(con.getType());
+        expResult.appendCode(bc);
+    }
+    | expResult = instanciacion()
+    | <LOpenBracket> expResult = exp() <ROpenBracket>
+    |
+    expResult = arregloConstr(CtClass.voidType)
+
+    )
+    {
+        return expResult;
+    }
+}
+
+
+Expresion defaultFunction () :
+{
+    if(debug)
+        System.out.println("defaultFunction() --> ");
+
+    Expresion result = new Expresion();
+    Expresion arg = new Expresion();
+    Bytecode code = new Bytecode(declaring.getConstPool());
+    CtClass returnType;
+    Token tok;
+}
+{
+    (
+    tok = <TRandom> <LOpenBracket> <ROpenBracket>
+    {
+        // Función: aleatorio()
+
+        code.addInvokestatic("java.lang.Math", "random", "()D");
+
+        if(Descriptor.of(FLOAT_TYPE).equals("F")){
+            code.add(Bytecode.D2F);
+        }
+
+        returnType = FLOAT_TYPE;
+    }
+    |
+    tok = <TRound> <LOpenBracket> arg = exp() <ROpenBracket>
+    {
+        // Función: redondear()
+
+        code = arg.getCode();
+
+        if(!compatibleTypes(arg.getType(), FLOAT_TYPE)){
+            if(compatibleTypes(arg.getType(), CtClass.intType)){
+                code.add(Bytecode.I2F);
+            }else if(compatibleTypes(arg.getType(), CtClass.longType)){
+                code.add(Bytecode.L2D);
+            }else{
+                Errors.add("Funcion de redondeo aplicada a un tipo incompatible. ", getToken(0));
+            }
+
+        }else{ 
+            code.addInvokestatic("java.lang.Math", "round", "(" + Descriptor.of(FLOAT_TYPE) + ")" + 
+                Descriptor.of(INTEGER_TYPE));
+        }
+
+        returnType = INTEGER_TYPE;
+    }
+    |
+    tok = <TCeil> <LOpenBracket> arg = exp() <ROpenBracket>
+    {
+        // Función: techo()
+
+        code = arg.getCode();
+
+        if(!compatibleTypes(arg.getType(), FLOAT_TYPE)){
+            if(compatibleTypes(arg.getType(), CtClass.intType)){
+                code.add(Bytecode.I2D);
+            }else if(compatibleTypes(arg.getType(), CtClass.longType)){
+                code.add(Bytecode.L2D);
+            }else{
+                Errors.add("Funcion de techo aplicada a un tipo incompatible. ", getToken(0));
+            }
+        }else{ 
+            if(Descriptor.of(FLOAT_TYPE).equals("F")){
+                code.add(Bytecode.F2D);
+            }
+
+            code.addInvokestatic("java.lang.Math", "ceil", "(D)D");
+
+            if(Descriptor.of(FLOAT_TYPE).equals("F")){
+                code.add(Bytecode.D2F);
+            }
+        }
+        
+        returnType = FLOAT_TYPE;
+    }
+    |
+    tok = <TSqrt> <LOpenBracket> arg = exp() <ROpenBracket>
+    {
+        // Función: raiz()  // raiz cuadrada
+
+        code = arg.getCode();
+
+        if(!compatibleTypes(arg.getType(), FLOAT_TYPE)){
+            if(compatibleTypes(arg.getType(), CtClass.intType)){
+                code.add(Bytecode.I2D);
+            }else if(compatibleTypes(arg.getType(), CtClass.longType)){
+                code.add(Bytecode.L2D);
+            }else{
+                Errors.add("Funcion raiz cuadrada aplicada a un tipo incompatible. ", getToken(0));
+            }
+        }else{ 
+            if(Descriptor.of(FLOAT_TYPE).equals("F")){
+                code.add(Bytecode.F2D);
+            }
+
+            code.addInvokestatic("java.lang.Math", "sqrt", "(D)D");
+
+            if(Descriptor.of(FLOAT_TYPE).equals("F")){
+                code.add(Bytecode.D2F);
+            }
+        }
+        
+        returnType = FLOAT_TYPE;
+    }
+    /*|
+    <TCos>
+    |
+    <TSin>
+    |
+    <TTan>*/
+
+    )
+    {
+        result.setType(returnType);
+        result.appendCode(code);
+        
+        if(debug)
+            System.out.println("\"" + tok.image + "\" ");
+        
+        return result;
+    }
+}
+
+
+Constante constante () :
+{
+    if(debug) System.out.println("constante() --> ");
+
+    Token tok;
+    Constante constant;
+}
+{
+    (tok = <cint>
+    {
+        constant = new Constante(INTEGER_TYPE, tok.image);
+    }
+    | tok = <cfloat>
+    {
+        constant = new Constante(FLOAT_TYPE, tok.image);
+    }
+    | tok = <TVerdad>
+    {
+        constant = new Constante(CtClass.booleanType, tok.image);
+    }
+    | tok = <TFalso>
+    {
+        constant = new Constante(CtClass.booleanType, tok.image);
+    }
+    | tok = <TNull>
+    {
+        constant = new Constante(CtClass.voidType, tok.image);
+    }
+    | tok = <character>
+    {
+        constant = new Constante(CtClass.charType, tok.image);
+    }
+    | tok = <string>
+    {
+        CtClass clase = CtClass.voidType;
+        try{
+            clase = classPool.get("java.lang.String");
+        }catch(NotFoundException e){
+            Errors.add("FATAL: Error al cargar la clase java.lang.String", getToken(0));
+        }
+
+        constant = new Constante(clase, tok.image.substring(1, tok.image.length() - 1));
+    })
+    {
+        if(debug){
+            System.out.println("\"" + tok.image + "\" ");
+        }
+        return constant;
+    }
+}
+
+
+/**
+* Reglas para la primera pasada (sólo declaraciones de tipos, clases y métodos 
+*/
+
+
+void pre_axiom () : 
+{
+    if(debug) System.out.println("pre_axiom() --> ");
+}
+{
+    (pre_dclTipo())* [pre_lClases()] pre_ini()
+}
+
+
+void pre_dclTipo () :
+{
+    if(debug) System.out.println("pre_dclTipo() --> ");
+}
+{
+    pre_registro() |
+    pre_alias() <TSemicolon>
+}
+
+
+void pre_registro () :
+{
+    if(debug) System.out.println("pre_registro() --> ");
+
+    Token tok;
+    ClassFile nuevaClase;
+    CtClass tipo = CtClass.voidType;
+    Bytecode initCode;
+}
+{
+    <TRegistro> tok = <id> [<TEq>] skip_to("FRegistro") <TFRegistro>
+    {   
+        
+        if(pendingTypes.contains(tok.image)){
+            pendingTypes.remove(tok.image);
+        }else{
+            if(!declaredTypes.exists(tok.image)){
+                nuevaClase = createClass(tok.image);
+
+                try{
+                    tipo = classPool.get(tok.image);
+                }catch(NotFoundException nf){
+                    Errors.add("Error al cargar la clase " + tok.image + 
+                            " (" + nf.getMessage() + ")", getToken(0));
+                    //nf.printStackTrace();
+                }
+
+                declaredTypes.add(tok.image, tipo);
+
+                if (!addRegistry(tipo)){
+                    Errors.add("Declaración duplicada o inválida de registro: " + 
+                            tipo.getName(), getToken(0));
+                }
+            }else{
+                Errors.add("Definición duplicada de registro: " + tok.image); 
+            }
+        }
+    }
+}
+
+
+void pre_alias () :
+{
+    if(debug) System.out.println("pre_alias() --> ");
+    
+    Token tok;
+    CtClass tipo;
+}
+{
+    <TTipo> tipo = tipoBase() <TComo> tok = <id>
+    {   
+        declaredTypes.add(tok.image, tipo);
+    }
+}
+
+
+void pre_lClases () :
+{
+    if(debug) System.out.println("pre_lClases() --> ");
+}
+{
+    (pre_clase())+
+}
+
+
+void pre_clase () :
+{
+    if(debug) System.out.println("pre_clase() --> ");
+
+    ClassFile nuevaClase;
+    String nombre = new String();
+    String nombreSuper = new String("");
+    Bytecode atributosInit;     // ????
+    ArrayList<MethodInfo> metodos = new ArrayList<MethodInfo>();       
+    Token tok;
+    ClassFile superClass;
+    String[] metodos_or_fclase = {"accion", "funcion", "fclase"};
+}
+{
+    <TClase> tok = <id> 
+    { nombre = new String(tok.image); }
+    [nombreSuper = herencia()]
+    {
+
+        nuevaClase = getOrCreateClass(nombre);
+        declaring = nuevaClase;
+
+        if(!nombreSuper.equals(""))
+        {
+            if(declaredTypes.exists(nombreSuper)){
+                superClass = getClassFile(nombreSuper);
+            }else{
+            // Si la clase heredada no está definida, la pre-declara y la marca como tipo pendiente
+                superClass = createClass(nombreSuper);
+                try{
+                    declaredTypes.add(nombreSuper, classPool.get(nombreSuper));
+                }catch(NotFoundException nf){
+                    Errors.add("Error al crear clase: " + nombreSuper, getToken(0));
+                }
+                pendingTypes.add(nombreSuper);
+            }
+
+            try{
+                nuevaClase.setSuperclass(superClass.getName());
+            }catch(CannotCompileException e){
+                // No debería suceder
+                Errors.add("No se consiguió la superclase \"" + nombreSuper 
+                        + "\" (" + e.getMessage() + ")", getToken(0));
+            }
+        }
+
+        try{
+            // Si la clase ya fue definida de forma adelantada,
+            // la elimina de la lista de tipos pendientes
+            if(pendingTypes.contains(nuevaClase.getName())){
+                pendingTypes.remove(nuevaClase.getName());
+            }else{
+                declaredTypes.add(nuevaClase.getName(), classPool.get(nuevaClase.getName()));
+            }
+        }catch(NotFoundException nf){
+            //this should never happen
+            Errors.add("No se consiguió la clase "+ nuevaClase.getName() + 
+                    "(" + nf.getMessage() + ")", getToken(0));
+        }
+    }
+    
+    skip_to_tokens(metodos_or_fclase)
+    [pre_metodos()]
+
+    <TFClase>
+    {
+        declaring = null;
+    }    
+}
+
+
+void pre_metodos () :
+{
+    if(debug) System.out.println("pre_metodos() --> ");
+    int access = AccessFlag.PUBLIC;
+}
+{
+    (
+    [access = acceso()] pre_funcion(access) |
+    [access = acceso()] pre_accion(access)
+    )+
+}
+
+
+void pre_funcion (int access) :
+{
+    if(debug) System.out.println("pre_funcion() --> ");
+}
+{
+    pre_funcionIni(access) skip_to("FFuncion") <TFFuncion>
+}
+
+
+void pre_funcionIni (int accessFlags) :
+{
+    if(debug) System.out.println("pre_funcionIni() --> ");
+
+    Token tok;
+    CtClass tipo;
+    Parametro parametros[] = new Parametro[0];
+    CtClass[] paramTypes = new CtClass[0];
+}
+{
+    <TFuncion> tok = <id> <LOpenBracket> parametros = listaParam() <ROpenBracket> 
+    <TColon> tipo = tipoGeneral()
+    {
+        /* Bloque de Parámetros */
+        int paramCount = parametros.length;
+        paramTypes = new CtClass[paramCount];
+
+        for(int i = 0; i < paramCount; i++){
+            paramTypes[i] = parametros[i].getType();
+        }
+        /* Fin de bloque de parámetros */
+
+        String paramDesc = Descriptor.ofParameters(paramTypes);
+
+        MethodInfo unaFuncion = new MethodInfo(declaring.getConstPool(), tok.image, paramDesc + Descriptor.of(tipo));
+        unaFuncion.setAccessFlags(accessFlags);
+
+        try{
+            declaring.addMethod(unaFuncion);
+        }catch(DuplicateMemberException e){
+            Errors.add("Definicion duplicada para la función: \"" + unaFuncion.getName() + "\"", 
+                getToken(0));
+        }   
+
+    }
+}
+
+
+void pre_accion (int access) :
+{
+    if(debug) System.out.println("pre_accion() --> ");
+}
+{
+    pre_accionIni(access) skip_to("FAccion") <TFAccion>
+}
+
+
+void pre_accionIni (int accessFlags) :
+{
+    if(debug) System.out.println("pre_accionIni() --> ");
+    
+    Parametro parametros[] = new Parametro[0];
+    CtClass[] paramTypes = new CtClass[0];
+    Token tok;
+}
+{
+    <TAccion> tok = <id> <LOpenBracket> parametros = listaParam() <ROpenBracket>
+    {
+        /* Bloque de Parámetros */
+        int paramCount = parametros.length;
+        paramTypes = new CtClass[paramCount];
+
+        for(int i = 0; i < paramCount; i++){
+            paramTypes[i] = parametros[i].getType();
+        }
+        /* Fin de bloque de parámetros */
+
+        String paramDesc = Descriptor.ofParameters(paramTypes);
+
+        MethodInfo unaAccion = new MethodInfo(declaring.getConstPool(), tok.image, paramDesc + "V");
+        unaAccion.setAccessFlags(accessFlags);
+
+        try{
+            declaring.addMethod(unaAccion);
+        }catch(DuplicateMemberException e){
+            Errors.add("Definicion duplicada para la acción: \"" + unaAccion.getName() + "\"", 
+                getToken(0));
+        }   
+
+    }
+}
+
+
+void pre_ini () :
+{
+    if(debug) System.out.println("pre_ini() --> ");
+
+    ClassFile initClass = createClass("InitClass");
+    initClass.setAccessFlags(AccessFlag.STATIC);
+    declaring = initClass;
+}
+{
+    <TPrograma> [pre_dcls(Variable.STATIC)] pre_prog() <TFPrograma>
+}
+
+
+void pre_dcls (int varForm) :
+{
+    if(debug) System.out.println("pre_dcls() --> ");
+
+    String[] procedure_def = {"accion", "funcion", "accion principal"};
+}
+{
+    skip_to_tokens(procedure_def)
+    (
+    pre_dclFun(AccessFlag.STATIC)
+    )*
+}
+
+
+void pre_dclFun (int accessFlags) :
+{
+    if(debug) System.out.println("pre_dclFun() --> ");
+}
+{
+    pre_funcion(accessFlags) |
+    pre_accion(accessFlags)
+}
+
+
+void pre_prog () :
+{
+    if(debug){ 
+        System.out.println("pre_prog() --> ");
+    }
+
+}
+{
+    <TAccionPrincipal>[<LOpenBracket>  <ROpenBracket>] skip_to("FAccion") <TFAccion>
+    {
+        declaring = null;
+    }
+}
+
+void deleteClassFiles () :
+{
+    if(debug){
+        System.out.println("deleteClassFiles() --> ");
+    }
+}
+{
+    delete_all_classes() <EOF>
+}
+
+
+/**
+ * Procedimientos auxiliares para el preprocesamiento
+ */
+
+JAVACODE void skip() {
+  Token tok = getNextToken();
+}
+
+JAVACODE void skip_to(String target) {
+  Token tok;
+
+  while (true) {
+    tok = getToken(1);
+    if (tok.image.equalsIgnoreCase(target)){
+        break;
+    }
+
+    tok = getNextToken();
+  }
+}
+
+JAVACODE void skip_to_tokens(String[] target) {
+  Token tok;
+  
+  while (true) {
+    tok = getToken(1);
+    
+    for(int x = 0; x < target.length; x++) {
+        if (tok.image.equalsIgnoreCase(target[x])){
+            return;
+        }
+    }
+
+    tok = getNextToken();
+  }
+}
+
+JAVACODE void delete_all_classes(){
+    Token tok = getNextToken();
+    Token cname;
+    
+    while (tok.kind != 0){   //Mientras el token actual sea distinto de <EOF>
+        
+        if(tok.image.equalsIgnoreCase("Clase")){
+            cname = getToken(1);
+            File fl = new File(cname + ".class");
+            if (fl.exists()) {
+                fl.delete();
+                System.out.println(cname + ".class deleted.");
+            }
+        }
+        tok = getNextToken();
+    }
+}
+
+
+/**
+ * Definición de tokens léxicos
+ */
+
+TOKEN:
+{
+        <TNull : "Nada" | "NIL" | "Nulo">    {}
+}
+
+TOKEN:
+{
+        <TSelf : "Yo" | "Esto" | "Este" | "Esta">    {}
+}
+
+TOKEN:
+{
+        <TSqrt : "raiz">    {}
+}
+
+TOKEN:
+{
+        <TCeil : "techo">   {}
+}
+
+TOKEN:
+{
+        <TRound : "redondear">   {}
+}
+
+TOKEN:
+{
+        <TRandom : "aleatorio">   {}
+}
+
+TOKEN:
+{
+	<TTam : "tam" >	{ //System.out.println("\"Tam\"");
+                                }
+}
+
+TOKEN:
+{
+	<TClase : "Clase" >	{ //System.out.println("\"CLASE\"");
+                                }
+}
+
+TOKEN:
+{
+	<TFClase : "FClase" >	{ //System.out.println("\"FCLASE\"");
+                                }
+}
+
+TOKEN:
+{
+	<TExtends : "Hereda de" >	{ //System.out.println("\"HEREDA DE\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TPublico : "Publico" >	{ //System.out.println("\"PUBLICO\"");
+                                }
+}
+
+TOKEN:
+{
+	<TPrivado : "Privado" >	{ //System.out.println("\"PRIVADO\"");
+                                }
+}
+
+TOKEN:
+{
+	<TProtegido : "Protegido" >	{ //System.out.println("\"PROTEGIDO\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TPrograma : "Programa" >	{ //System.out.println("\"PROGRAMA\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TFPrograma : "FPrograma" >	{ //System.out.println("\"FPROGRAMA\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TAccionPrincipal : "Accion Principal" >	{ //System.out.println("\"ACCION PRINCIPAL\"");
+                                                        }
+}
+
+TOKEN:
+{
+	<TFAccion : "FAccion" >	{ //System.out.println("\"FACCION\"");
+                                }
+}
+
+TOKEN:
+{
+	<TAccion : "Accion" >	{ //System.out.println("\"ACCION\"");
+                                }
+}
+
+TOKEN:
+{
+	<TFuncion : "Funcion" >	{ //System.out.println("\"FUNCION\"");
+                                }
+}
+
+TOKEN:
+{
+	<TFFuncion : "FFuncion" >	{ //System.out.println("\"FFUNCION\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TRetornar : "Retornar" >	{ //System.out.println("\"RETORNAR\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TRegistro : "Registro" >	{ //System.out.println("\"REGISTRO\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TFRegistro : "FRegistro" >	{ //System.out.println("\"FREGISTRO\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TTipo : "Tipo" >	{ //System.out.println("\"TIPO\"");
+                                }
+}
+
+TOKEN:
+{
+	<TComo : "Como" >	{ //System.out.println("\"COMO\"");
+                                }
+}
+
+TOKEN:
+{
+	<TDe : "De" >	{ //System.out.println("\"DE\"");
+                        }
+}
+
+TOKEN:
+{
+	<TLogico : "Logico" >	{ //System.out.println("\"LOGICO\"");
+                                }
+}
+
+TOKEN:
+{
+	<TEntero : "Entero" >	{ //System.out.println("\"ENTERO\"");
+                                }
+}
+
+TOKEN:
+{
+	<TReal : "Real" >	{ //System.out.println("\"REAL\"");
+                                }
+}
+
+TOKEN:
+{
+	<TCaracter : "Caracter" >	{ //System.out.println("\"CARACTER\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TCadena : "Cadena" >	{ //System.out.println("\"CADENA\"");
+                                }
+}
+
+TOKEN:
+{
+	<TArreglo : "Arreglo" >	{ //System.out.println("\"ARREGLO\"");
+                                }
+}
+
+TOKEN:
+{
+	<TSubrango : "Subrango" >	{ //System.out.println("\"ARREGLO\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TDotDotDot : "..." >	{ //System.out.println("\".\"");
+                        }
+}
+
+TOKEN:
+{
+	<TEnumerado : "Enumerado" >	{ //System.out.println("\"ARREGLO\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TLeer : "Leer" >	{ //System.out.println("\"LEER\"");
+                                }
+}
+
+TOKEN:
+{
+	<TEscribir : "Escribir" >	{ //System.out.println("\"ESCRIBIR\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TNuevo : "Nuevo"|"Nueva" >	{ //System.out.println("\"NUEVO\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TMientras : "Mientras" >	{ ///System.out.println("\"MIENTRAS\"");
+                                        }
+}
+
+TOKEN:
+{
+	<THacer : "Hacer" >	{ //System.out.println("\"HACER\"");
+                                }
+}
+
+TOKEN:
+{
+	<TFMientras : "FMientras" >	{ //System.out.println("\"FMIENTRAS\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TRepetir : "Repetir" >	{ //System.out.println("\"REPETIR\"");
+                                }
+}
+
+TOKEN:
+{
+	<THasta : "Hasta" > 	{ //System.out.println("\"HASTA\"");
+                                }
+}
+
+TOKEN:
+{
+	<TSeleccion : "Seleccion" >	{ //System.out.println("\"SELECCION\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TFSeleccion : "FSeleccion" >	{ //System.out.println("\"FSELECCION\"");
+                                        }
+}
+
+TOKEN:
+{
+	<TPara : "Para" >	{ //System.out.println("\"PARA\"");
+                                }
+}
+
+TOKEN:
+{
+	<TEn : "En" >	{ //System.out.println("\"EN\"");
+                        }
+}
+
+TOKEN:
+{
+	<TFPara : "FPara" >	{ //System.out.println("\"FPARA\"");
+                                }
+}
+
+TOKEN:
+{
+	< TSi : "Si" >	{ //System.out.println("\"SI\"");
+                        }
+}
+
+TOKEN:
+{
+	< TFSi : "Fsi" >	{ //System.out.println("\"FSI\"");
+                                }
+}
+
+TOKEN:
+{
+	< TSino : "Sino" > 	{ //System.out.println("\"SINO\"");
+                                }
+}
+
+TOKEN:
+{
+	< TEntonces : "Entonces" > 	{ //System.out.println("\"ENTONCES\"");
+                                        }
+}
+
+TOKEN:
+{
+	< TVerdad : "verdad"|"verdadero" >	{ //System.out.println("\"VERDADERO\"");
+                                        }
+}
+
+TOKEN:
+{
+	< TFalso : "falso" >	{ //System.out.println("\"FALSO\"");
+                                }
+}
+
+TOKEN:
+{
+	<TEq : "=" >	{ //System.out.println("\"=\"");
+                        }
+}
+
+TOKEN:
+{
+	< OpEq  : "==" >	{ //System.out.println("\"==\"");
+                                }
+}
+
+TOKEN:
+{
+	< OpNeq  : "!=" >	{ //System.out.println("\"!=\"");
+                                }
+}
+
+TOKEN:
+{
+	< OpLt  : "<" >	{ //System.out.println("\"<\"");
+                        }
+}
+
+TOKEN:
+{
+	< OpLe  : "<=" >	{ //System.out.println("\"<=\"");
+                                }
+}
+TOKEN:
+{
+	< OpGt  : ">" >	{ //System.out.println("\">\"");
+                        }
+}
+
+TOKEN:
+{
+	< OpGe  : ">=" >	{ //System.out.println("\">=\"");
+                                }
+}
+
+TOKEN:
+{
+	< OpAdd  : "+" >	{ //System.out.println("\"+\"");
+                                }
+}
+
+TOKEN:
+{
+	< OpSub  : "-" >	{ //System.out.println("\"-\"");
+                                }
+}
+
+TOKEN:
+{
+	< OpMul  : "*" >	{ ///System.out.println("\"*\"");
+                                }
+}
+
+TOKEN:
+{
+	< OpMod  : "Mod" >	{ //System.out.println("\"MOD\"");
+                                }
+}
+
+TOKEN:
+{
+	< OpDiv  : "Div" >	{ //System.out.println("\"DIV\"");
+                                }
+}
+
+TOKEN:
+{
+	< OpFDiv  : "/" >	{ //System.out.println("\"/\"");
+                                }
+}
+
+TOKEN:
+{
+	< OpPow  : "^" >	{ //System.out.println("\"^\"");
+                                }
+}
+
+TOKEN:
+{
+	< OpFalse  : "!" >	{ //System.out.println("\"!\"");
+                                }
+}
+
+TOKEN:
+{
+	<LOpenBracket :	"(" >	{ //System.out.println("\"(\"");
+                                }
+}
+
+TOKEN:
+{
+	<ROpenBracket :	")" >	{ //System.out.println("\")\"");
+                                }
+}
+
+TOKEN:
+{
+	<TDot : "." >	{ //System.out.println("\".\"");
+                        }
+}
+
+TOKEN:
+{
+	<TComma : "," >	{ //System.out.println("\",\"");
+                        }
+}
+
+TOKEN:
+{
+	<TConstante : "Constante" >	{ //System.out.println("<TConstante>");
+                                        }
+}
+
+TOKEN:
+{
+	<LClosedBracket : "[" >	{ //System.out.println("\"[\"");
+                                }
+}
+
+TOKEN:
+{
+	<RClosedBracket : "]" >	{ //System.out.println("\"]\"");
+                                }
+}
+
+TOKEN:
+{
+    <LBrace : "{">  { //System.out.println("\"{\"");
+                    }
+}
+
+TOKEN:
+{
+    <RBrace : "}"> { //System.out.println("\"}\"");
+                    }
+}
+
+TOKEN:
+{
+	<TSemicolon : ";" >	{ //System.out.println("\";\"");
+                                }
+}
+
+TOKEN:
+{
+	<TColon : ":" >	{ //System.out.println("\":\"");
+                        }
+}
+
+TOKEN:
+{
+	<OpOr : "||" >	{ //System.out.println("\"||\"");
+                        }
+}
+
+TOKEN:
+{
+	<OpAnd : "&&" >	{ //System.out.println("\"&&\"");
+                        }
+}
+
+TOKEN:
+{
+	< # alfa : ["a"-"z", "A"-"Z"] > 
+}
+
+TOKEN:
+{
+	< # digito : ["0"-"9"] > 
+}
+
+TOKEN:
+{
+        < # signo : ["-","+"]> 
+}
+
+TOKEN:
+{
+	< # exponente : ["e","E"](<signo>)?(<digito>)+ >
+}
+
+TOKEN:
+{
+	< cint : (<digito>)+ >	{ //System.out.println("<cint>");
+                                                }
+}
+
+TOKEN:
+{
+	< id : (<alfa> | "_")(<alfa>|<digito>|"_")* >	{ //System.out.println("<id>");
+                                                        }
+}
+
+TOKEN:
+{
+	< cfloat :  (<signo>)? ((((<digito>)*"."(<digito>)+ | (<digito>)+"."(<digito>)*) (<exponente>)?) | (<digito>)+ (<exponente>)) >	{ //System.out.println("<cfloat>");
+                                                                                                                                        }
+}
+
+TOKEN:
+{
+	< character : "'"(<alfa>)?"'" >	{ //System.out.println("<character>");
+                                        }
+}
+
+TOKEN:
+{
+	< string : "\""(~["\""])*"\"">	{ //System.out.println("<string>");
+                                        }
+}
+
+/**
+ * Tokens especiales (para ignorar, cambiar de estado, etc)
+ */
+
+SKIP: {	" " | "\t" | "\n" {Errors.newLine();} | "\r" }
+
+MORE : { "/*" : IN_COMMENT1 }
+
+< IN_COMMENT1 > MORE : { <  ~[] > }
+
+< IN_COMMENT1 > SKIP : { "*/": DEFAULT }
+
+MORE : { "#": IN_SINGLE_LINE_COMMENT }
+
+< IN_SINGLE_LINE_COMMENT > SPECIAL_TOKEN :
+{
+
+    < SINGLE_LINE_COMMENT: "\n" |"\r"|"\r\n" > : DEFAULT
+}
+
+< IN_SINGLE_LINE_COMMENT > MORE : { <  ~[] > }
