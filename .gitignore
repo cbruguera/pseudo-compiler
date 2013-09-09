@@ -6,3 +6,17 @@
 *.ear
 
 /nbproject
+/nbproject
+/nbproject/private
+/nbproject/build-impl.xml
+/nbproject/genfiles.properties
+/nbproject/project.properties
+/nbproject/project.xml
+/nbproject/private/config.properties
+/nbproject/private/private.properties
+/nbproject/private/private.xml
+/nbproject/private/private.xml.0.nblh~
+/nbproject/private/private.xml.1.nblh~
+/nbproject/private/private.xml.2.nblh~
+/nbproject/private/private.xml.3.nblh~
+/nbproject/private/private.xml.4.nblh~
